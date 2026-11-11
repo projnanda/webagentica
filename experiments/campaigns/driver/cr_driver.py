@@ -1,0 +1,404 @@
+"""The `Cr` driver's Python side (PROTOCOL.md §2.1, D-353): build the Node driver beside a private
+copy of the Chrome core, run one job, and write the campaign run record.
+
+The build copies `chrome-agent-browser/src` into `experiments/campaigns/.cache/cr-<key>/src`
+(git-ignored; the production tree is only read), places `driver/node/driver.ts` beside it,
+type-checks the copy with the core's own TypeScript and bundles the driver and the compute Worker
+entry with the core's own esbuild (as T30's catalog builds do, D-301). The key hashes the core's
+sources, the driver, the lockfile and the tool versions, so an unchanged tree is reused. It needs
+`npm ci` in `chrome-agent-browser`.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import time
+from pathlib import Path
+
+from campaigns.driver import record
+from campaigns.driver.py_driver import (
+    FIXTURE_HOSTS,
+    PACKAGES,
+    TRAVEL_GRANTS,
+    literature_grants,
+    literature_input,
+    prepare_memory,
+    webair_grants,
+)
+from campaigns.driver.responder import Responder
+from campaigns.driver.routes import Rung
+
+ROOT = Path(__file__).resolve().parents[3]
+CHROME = ROOT / "chrome-agent-browser"
+CHROME_SRC = CHROME / "src"
+NODE_MODULES = CHROME / "node_modules"
+TSC = NODE_MODULES / "typescript" / "bin" / "tsc"
+ESBUILD = NODE_MODULES / "esbuild" / "lib" / "main.js"
+DRIVER = Path(__file__).resolve().parent / "node"
+CACHE = Path(__file__).resolve().parents[1] / ".cache"
+
+BUNDLE = """
+import {{ build }} from {esbuild};
+const common = {{
+  bundle: true, minify: false, sourcemap: false, legalComments: "inline", logLevel: "warning",
+  format: "esm", platform: "node", target: ["node24"],
+}};
+await build({{ ...common, entryPoints: [{driver}], outfile: {driver_out} }});
+await build({{ ...common, entryPoints: [{worker}], outfile: {worker_out} }});
+"""
+
+
+def _tree(root: Path, suffixes: tuple[str, ...]) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        if path.is_file() and path.suffix in suffixes:
+            digest.update(path.relative_to(root).as_posix().encode() + b"\0")
+            digest.update(path.read_bytes() + b"\0")
+    return digest.hexdigest()
+
+
+def _tools() -> str:
+    tsc = json.loads((NODE_MODULES / "typescript" / "package.json").read_text())["version"]
+    esb = json.loads((NODE_MODULES / "esbuild" / "package.json").read_text())["version"]
+    node = subprocess.run(["node", "--version"], capture_output=True, text=True).stdout.strip()
+    return f"tsc {tsc}; esbuild {esb}; node {node}"
+
+
+def build_key() -> str:
+    material = (
+        _tree(CHROME_SRC, (".ts", ".json"))
+        + _tree(DRIVER, (".ts", ".json"))
+        + (CHROME / "package-lock.json").read_text()
+        + _tools()
+    )
+    return hashlib.sha256(material.encode()).hexdigest()[:20]
+
+
+def build() -> Path:
+    """The bundled driver (`<build>/driver/driver.js`), built once per key."""
+    if not TSC.is_file():
+        raise RuntimeError("the Cr driver needs `npm ci` in chrome-agent-browser")
+    key = build_key()
+    target = CACHE / f"cr-{key}"
+    if (target / ".complete").is_file():
+        return target
+    staging = CACHE / f".staging-cr-{key}-{os.getpid()}"
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True)
+    shutil.copytree(CHROME_SRC, staging / "src")
+    (staging / "driver").mkdir()
+    for name in ("driver.ts", "tsconfig.json"):
+        shutil.copy2(DRIVER / name, staging / "driver" / name)
+    shutil.copy2(CHROME / "package.json", staging / "package.json")
+    os.symlink(NODE_MODULES, staging / "node_modules")
+    checked = subprocess.run(
+        ["node", str(TSC), "-p", str(staging / "driver" / "tsconfig.json")],
+        cwd=staging,
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    if checked.returncode != 0:
+        raise RuntimeError(f"tsc failed:\n{checked.stdout[-4000:]}\n{checked.stderr[-2000:]}")
+    script = BUNDLE.format(
+        esbuild=json.dumps(ESBUILD.as_uri()),
+        driver=json.dumps(str(staging / "driver" / "driver.ts")),
+        driver_out=json.dumps(str(staging / "driver" / "driver.js")),
+        worker=json.dumps(str(staging / "src" / "compute-worker-node.ts")),
+        worker_out=json.dumps(str(staging / "driver" / "compute-worker.js")),
+    )
+    bundled = subprocess.run(
+        ["node", "--input-type=module", "-e", script],
+        cwd=staging,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    if bundled.returncode != 0:
+        raise RuntimeError(f"esbuild failed:\n{bundled.stderr[-4000:]}")
+    (staging / "node_modules").unlink()
+    (staging / "build.json").write_text(
+        json.dumps(
+            {
+                "key": key,
+                "tools": _tools(),
+                "source_sha256": _tree(staging / "src", (".ts", ".json")),
+                "driver_sha256": hashlib.sha256(
+                    (staging / "driver" / "driver.js").read_bytes()
+                ).hexdigest(),
+            },
+            indent=2,
+        )
+    )
+    (staging / ".complete").write_text("")
+    if target.exists():
+        shutil.rmtree(staging)
+    else:
+        staging.rename(target)
+    return target
+
+
+def run_job(job: dict, *, timeout: float = 3600) -> dict:
+    built = build()
+    try:
+        done = subprocess.run(
+            ["node", str(built / "driver" / "driver.js")],
+            input=json.dumps(job),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        # A stalled job (a hosted request that never answers) is this unit's harness error, not
+        # the campaign's end (review 1, finding 9); `subprocess.run` has killed the child.
+        return {"status": "harness_error", "error": f"the Cr driver ran over {timeout:g} s"}
+    lines = [line for line in done.stdout.splitlines() if line.startswith("{")]
+    if not lines:
+        return {
+            "status": "harness_error",
+            "error": f"the Cr driver exited {done.returncode}: {done.stderr[-500:]}",
+        }
+    return json.loads(lines[-1])
+
+
+def route_of(rung: Rung | None) -> dict:
+    if rung is None:
+        return {"kind": "refuse", "model": "refuse"}
+    return {
+        "kind": rung.provider,
+        "model": rung.model,
+        "base_url": rung.base_url,
+        "context_window": rung.context_window,
+        "temperature": rung.temperature,
+        "think": rung.think,
+        "api_key_env": rung.api_key_env,
+        "timeout_seconds": rung.timeout_seconds,
+    }
+
+
+def record_texts(memory_dir: Path) -> list[str]:
+    return [p.read_text() for p in sorted(Path(memory_dir).glob("*/*.md"))]
+
+
+def host_mapping(stack, fixture_key: str | None) -> dict | None:
+    """The job's host mapping (the stack's hostnames dialed at loopback, its CA, the fixture key
+    and hosts), one for both modes (review 1, nit 7); none without a stack."""
+    if stack is None:
+        return None
+    return {
+        "hosts": {h: [a, p] for h, (a, p) in stack.hosts.items()},
+        "ca": str(stack.ca),
+        "fixture_key": fixture_key,
+        "fixture_hosts": list(FIXTURE_HOSTS),
+    }
+
+
+def webair_job(
+    *,
+    turns: list[str],
+    rung: Rung | None,
+    memory_dir: Path,
+    stack,
+    responder: Responder,
+    fixture_key: str | None,
+    grant_profile: bool = False,
+    probe_proposals=None,
+    tool_ids: list[str] | None = None,
+) -> dict:
+    grants, memory_flags = webair_grants(grant_profile)
+    package, key = PACKAGES["webair"]
+    job = {
+        "package": str(package),
+        "trust_key": str(key),
+        "transcript": {
+            "schema": "conversation.transcript.v0",
+            "turns": [{"message": {"message": text}} for text in turns],
+        },
+        "grants": grants,
+        "approved_tools": sorted(tool_ids if tool_ids is not None else _tool_ids()),
+        "records": record_texts(memory_dir),
+        "memory_grants": dict(flag.split("=", 1) for flag in memory_flags),
+        "route": route_of(rung),
+        "mapping": host_mapping(stack, fixture_key),
+        "responder": responder.describe(),
+    }
+    if probe_proposals is not None:
+        job["probe_proposals"] = probe_proposals
+    return job
+
+
+def _tool_ids() -> list[str]:
+    from campaigns.baseline import ports
+
+    return list(ports.load("webair").tools)
+
+
+def run_webair(
+    *,
+    turns: list[str],
+    rung: Rung | None,
+    run_dir: Path,
+    stack,
+    responder: Responder,
+    fixture_key: str | None,
+    grant_profile: bool = False,
+    profile_insertion: str | None = None,
+    meta: dict,
+) -> dict:
+    """One WebAir conversation (TS-W, TS-C) on `Cr`; returns the campaign run record."""
+    from campaigns.baseline import ports
+
+    run_dir.mkdir(parents=True, exist_ok=False)
+    package = ports.load("webair")  # verified once per run
+    memory_dir = prepare_memory(run_dir, profile_insertion)
+    job = webair_job(
+        turns=turns,
+        rung=rung,
+        memory_dir=memory_dir,
+        stack=stack,
+        responder=responder,
+        fixture_key=fixture_key,
+        grant_profile=grant_profile,
+        tool_ids=list(package.tools),
+    )
+    origin_start = len(stack.origin_log) if stack else 0
+    sink_start = len(stack.sink.log) if stack else 0
+    started = time.monotonic()
+    out = run_job(job)
+    seconds = time.monotonic() - started
+    responder.decisions.extend(out.get("responder") or [])
+    return record.write(
+        run_dir,
+        record.from_cr_conversation(
+            meta=meta,
+            rung=rung,
+            out=out,
+            origin_log=stack.origin_log[origin_start:] if stack else [],
+            sink_log=stack.sink.log[sink_start:] if stack else [],
+            seconds=seconds,
+            package=package,
+            memory_grants=dict(job["memory_grants"]),  # the grants this run made
+        ),
+    )
+
+
+# -- the run mode (D-359): one-shot runs composed as `cli-run.ts` composes them ---------------
+def run_job_for(
+    *,
+    name: str,
+    input_value: dict,
+    grants: dict,
+    approved: list[str],
+    rung: Rung | None,
+    memory_dir: Path,
+    stack,
+    fixture_key: str | None,
+) -> dict:
+    """The `run` job: the signed package, its input, the grants and approvals, the record set (no
+    record granted; the store is opened all the same, as `Py`'s `--memory-dir`), the route and the
+    host mapping. The Node CLI binds no selected files, so a `Cr` run has none (D-359)."""
+    package, key = PACKAGES[name]
+    return {
+        "mode": "run",
+        "package": str(package),
+        "trust_key": str(key),
+        "input": input_value,
+        "grants": grants,
+        "approved_tools": sorted(approved),
+        "records": record_texts(memory_dir),
+        "memory_grants": {},
+        "route": route_of(rung),
+        "mapping": host_mapping(stack, fixture_key),
+        "responder": Responder("R-deny").describe(),
+    }
+
+
+def _run(
+    *,
+    name: str,
+    task_set: str,
+    input_value: dict,
+    grants: dict,
+    approved: list[str] | None,
+    rung: Rung,
+    run_dir: Path,
+    stack,
+    fixture_key: str | None,
+    meta: dict,
+) -> dict:
+    """`approved` None: every tool the package declares (from this one load, review 1, nit 8)."""
+    from campaigns.baseline import ports
+
+    run_dir.mkdir(parents=True, exist_ok=False)
+    package = ports.load(name)  # verified, as on `Py`; the Node driver verifies it again
+    job = run_job_for(
+        name=name,
+        input_value=input_value,
+        grants=grants,
+        approved=list(package.tools) if approved is None else approved,
+        rung=rung,
+        memory_dir=prepare_memory(run_dir, None),
+        stack=stack,
+        fixture_key=fixture_key,
+    )
+    origin_start = len(stack.origin_log)
+    resolver_start = len(stack.resolver_log)
+    sink_start = len(stack.sink.log)
+    started = time.monotonic()
+    out = run_job(job, timeout=float(package.graph.get("deadline_seconds") or 3600) + 600)
+    seconds = time.monotonic() - started
+    rec = record.from_cr_run(
+        meta=meta,
+        rung=rung,
+        out=out,
+        origin_log=stack.origin_log[origin_start:] + stack.resolver_log[resolver_start:],
+        sink_log=stack.sink.log[sink_start:],
+        seconds=seconds,
+        package=package,
+        task_set=task_set,
+    )
+    rec["input"] = input_value
+    rec["grants"] = grants
+    return record.write(run_dir, rec)
+
+
+def run_travel_network(
+    *, text: str, rung: Rung, run_dir: Path, stack, fixture_key: str | None, meta: dict
+) -> dict:
+    """One travel-network run (TS-N) on `Cr`, composed as `cli-run.ts` composes it."""
+    return _run(
+        name="travel-network",
+        task_set="TS-N",
+        input_value={"text": text},
+        grants=TRAVEL_GRANTS,
+        approved=None,
+        rung=rung,
+        run_dir=run_dir,
+        stack=stack,
+        fixture_key=fixture_key,
+        meta=meta,
+    )
+
+
+def run_literature_review(
+    *, question: str, rung: Rung, run_dir: Path, stack, fixture_key: str | None, meta: dict
+) -> dict:
+    """One Literature Review run (TS-L) on `Cr`, composed as `cli-run.ts` composes it, with no
+    selected files (the Node CLI binds none)."""
+    grants, approved = literature_grants(None)
+    return _run(
+        name="literature-review",
+        task_set="TS-L",
+        input_value=literature_input(question),
+        grants=grants,
+        approved=approved,
+        rung=rung,
+        run_dir=run_dir,
+        stack=stack,
+        fixture_key=fixture_key,
+        meta=meta,
+    )

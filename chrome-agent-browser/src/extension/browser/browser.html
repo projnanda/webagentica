@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WebAgents Agent Browser</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body class="ab-full">
+    <div class="ab-shell">
+      <nav class="ab-nav" aria-label="Sections">
+        <div class="ab-brand">WebAgents</div>
+        <a href="#open" data-view="open">Open</a>
+        <a href="#library" data-view="library">Library</a>
+        <a href="#runs" data-view="runs">Runs</a>
+        <a href="#trust" data-view="trust">Trust</a>
+        <a href="#memory" data-view="memory">Memory</a>
+        <a href="#settings" data-view="settings">Settings</a>
+        <div id="lock" class="ab-lock-host" aria-live="polite"></div>
+      </nav>
+      <main id="app" class="ab-app" aria-live="polite"></main>
+    </div>
+    <script type="module" src="browser.js"></script>
+  </body>
+</html>

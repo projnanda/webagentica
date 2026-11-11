@@ -1,0 +1,407 @@
+/**
+ * What this plugin asks OpenClaw for, and what it refuses to accept back.
+ *
+ * `api.runtime.llm.complete` is stubbed with the exact shape OpenClaw 2026.9.5
+ * returns, so the suite is deterministic and never spends a token. The real
+ * call is exercised by `scripts/router-probe.mjs` against a live host.
+ */
+import { describe, expect, it, vi } from "vitest";
+import { AgentBrowserError } from "../src/errors.js";
+import {
+  MAX_RESPONSE_FORMAT_BYTES,
+  RESPONSE_FORMAT_NAME,
+  asCompletionError,
+  completeWithBoundModel,
+  responseFormatFor,
+  type HostLlm,
+} from "../src/host-llm.js";
+
+const SCHEMA = {
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "object",
+  required: ["status"],
+  properties: { status: { const: "ok" } },
+  additionalProperties: false,
+};
+
+function llm(
+  result: Partial<Parameters<HostLlm["complete"]> extends never ? never : never> | unknown = {},
+  fail?: unknown,
+): { host: HostLlm; calls: Array<Record<string, unknown>> } {
+  const calls: Array<Record<string, unknown>> = [];
+  const host: HostLlm = {
+    complete: async (params) => {
+      calls.push(params as unknown as Record<string, unknown>);
+      if (fail) throw fail;
+      return {
+        text: '{"status":"ok"}',
+        provider: "acme",
+        model: "big",
+        responseModel: "big-2026-09-01",
+        stopReason: "stop",
+        usage: { inputTokens: 120, outputTokens: 8, totalTokens: 128, costUsd: 0.0004 },
+        execution: { mode: "direct-provider", owner: { kind: "provider", id: "acme" } },
+        ...(result as object),
+      };
+    },
+  };
+  return { host, calls };
+}
+
+describe("constrained output requests", () => {
+  it("maps an object schema onto OpenClaw's json_schema request shape", () => {
+    const mapped = responseFormatFor(SCHEMA);
+    expect(mapped?.format).toMatchObject({ type: "json_schema" });
+    const json = (mapped?.format as { json_schema: Record<string, unknown> }).json_schema;
+    expect(json.name).toBe(RESPONSE_FORMAT_NAME);
+    // Root annotations a provider's format parser has no use for are dropped;
+    // the constraint itself is preserved exactly.
+    expect(json.schema).toEqual({
+      type: "object",
+      required: ["status"],
+      properties: { status: { const: "ok" } },
+      additionalProperties: false,
+    });
+  });
+
+  it("inlines a $ref root so a bundled package schema can be constrained", () => {
+    // This is the exact shape `Workflow._model_schema` produces: one closed
+    // document, every package-relative reference moved into `$defs`, and a root
+    // that is nothing but a pointer into it. Before this was handled, every
+    // package node asked for no constraint at all.
+    const bundled = {
+      $ref: "#/$defs/s2",
+      $defs: {
+        s2: { type: "array", items: { $ref: "#/$defs/s1" } },
+        s1: {
+          type: "object",
+          required: ["role"],
+          properties: { role: { type: "string" } },
+          additionalProperties: false,
+        },
+      },
+    };
+    const mapped = responseFormatFor(bundled);
+    const json = (mapped?.format as { json_schema: Record<string, unknown> }).json_schema;
+    // The root now states what it describes, and `$defs` still resolves the
+    // inner reference, so the document remains closed and self-contained.
+    expect(json.schema).toEqual({
+      type: "array",
+      items: { $ref: "#/$defs/s1" },
+      $defs: bundled.$defs,
+    });
+  });
+
+  it("carries an array root, which a package is entitled to declare", () => {
+    const mapped = responseFormatFor({ type: "array", items: { type: "string" } });
+    const json = (mapped?.format as { json_schema: Record<string, unknown> }).json_schema;
+    expect(json.schema).toEqual({ type: "array", items: { type: "string" } });
+  });
+
+  it("declines rather than inventing a constraint it cannot express", () => {
+    // No stated root type: there is nothing for a provider to constrain.
+    expect(responseFormatFor({ properties: { a: { type: "string" } } })).toBeNull();
+    // A root reference that leads nowhere is left as the unusable thing it is.
+    expect(responseFormatFor({ $ref: "#/$defs/missing", $defs: {} })).toBeNull();
+    expect(responseFormatFor({ $ref: "https://example.test/s.json" })).toBeNull();
+    expect(responseFormatFor(true)).toBeNull();
+    expect(responseFormatFor(undefined)).toBeNull();
+    const huge = {
+      type: "object",
+      properties: Object.fromEntries(
+        Array.from({ length: 20_000 }, (_, index) => [`field${index}`, { type: "string" }]),
+      ),
+    };
+    expect(JSON.stringify(huge).length).toBeGreaterThan(MAX_RESPONSE_FORMAT_BYTES);
+    expect(responseFormatFor(huge)).toBeNull();
+  });
+
+  it("reports honestly when a request could not be constrained", async () => {
+    const { host } = llm();
+    const outcome = await completeWithBoundModel(host, {
+      modelId: "acme/big",
+      system: "s",
+      user: "u",
+      outputSchema: { properties: { a: { type: "string" } } },
+      maxOutputTokens: 64,
+    });
+    expect(outcome.constrained).toBe(false);
+    expect(outcome.constraintDetail).toContain("parses and");
+  });
+});
+
+describe("structured-output plumbing for a hosted provider", () => {
+  // The screen node's schema as `Workflow._model_schema` bundles it: a `$ref`
+  // root into `$defs`, closed objects, nullable unions and an enum.
+  const BUNDLED_PAPER = {
+    $ref: "#/$defs/s9",
+    $defs: {
+      s9: {
+        $schema: "https://json-schema.org/draft/2020-12/schema",
+        type: "object",
+        required: ["paper_id", "screening_status"],
+        properties: {
+          paper_id: { type: "string" },
+          doi: { type: ["string", "null"] },
+          screening_status: { enum: ["include", "maybe", "exclude", "pending"] },
+        },
+        additionalProperties: false,
+      },
+    },
+  };
+
+  it("sends an OpenAI-bound request the whole bundled schema, not a provider-specific form", async () => {
+    const { host, calls } = llm({ provider: "openai", model: "gpt-5.6-luna" });
+    const outcome = await completeWithBoundModel(host, {
+      modelId: "openai/gpt-5.6-luna",
+      system: "s",
+      user: "u",
+      outputSchema: BUNDLED_PAPER,
+      maxOutputTokens: 12000,
+      reasoning: "low",
+    });
+    expect(calls[0]).toMatchObject({ model: "openai/gpt-5.6-luna", maxTokens: 12000 });
+    // Same shape as for any other provider: OpenClaw's canonical json_schema,
+    // the root inlined and `$defs` kept so the document stays closed.
+    expect(calls[0].responseFormat).toEqual({
+      type: "json_schema",
+      json_schema: {
+        name: RESPONSE_FORMAT_NAME,
+        schema: {
+          type: "object",
+          required: ["paper_id", "screening_status"],
+          properties: BUNDLED_PAPER.$defs.s9.properties,
+          additionalProperties: false,
+          $defs: BUNDLED_PAPER.$defs,
+        },
+      },
+    });
+    // Requested is all this file can know: the route is chosen after auth
+    // resolution, and OpenClaw's native Codex backend drops the format.
+    expect(outcome.constrained).toBe(true);
+    expect(outcome.constraintDetail).toContain("does not report it");
+    expect(outcome.constraintDetail).toContain("not assumed");
+  });
+
+  it("hands every stop reason through unchanged for the router to classify", async () => {
+    for (const stopReason of ["stop", "length", "error", "aborted"]) {
+      const { host } = llm({ stopReason, text: stopReason === "stop" ? '{"status":"ok"}' : "" });
+      const outcome = await completeWithBoundModel(host, {
+        modelId: "acme/big",
+        system: "s",
+        user: "u",
+        outputSchema: SCHEMA,
+        maxOutputTokens: 64,
+      });
+      expect(outcome.stopReason).toBe(stopReason);
+    }
+  });
+});
+
+describe("exact model binding", () => {
+  it("always names the bound model and passes the cap and schema through", async () => {
+    const { host, calls } = llm();
+    await completeWithBoundModel(host, {
+      modelId: "acme/big",
+      system: "system text",
+      user: "user text",
+      outputSchema: SCHEMA,
+      maxOutputTokens: 256,
+      reasoning: "low",
+    });
+    expect(calls[0]).toMatchObject({
+      model: "acme/big",
+      systemPrompt: "system text",
+      maxTokens: 256,
+      reasoning: "low",
+      purpose: "agent-browser.router",
+    });
+    expect(calls[0].messages).toEqual([{ role: "user", content: "user text" }]);
+    expect(calls[0].responseFormat).toMatchObject({ type: "json_schema" });
+  });
+
+  it("refuses a completion that came from a different model", async () => {
+    const { host } = llm({ provider: "acme", model: "small" });
+    await expect(
+      completeWithBoundModel(host, {
+        modelId: "acme/big",
+        system: "s",
+        user: "u",
+        outputSchema: SCHEMA,
+        maxOutputTokens: 64,
+      }),
+    ).rejects.toMatchObject({ code: "selected_model_unavailable" });
+  });
+
+  it("propagates cancellation into the host call", async () => {
+    const { host, calls } = llm();
+    const controller = new AbortController();
+    await completeWithBoundModel(host, {
+      modelId: "acme/big",
+      system: "s",
+      user: "u",
+      outputSchema: SCHEMA,
+      maxOutputTokens: 64,
+      signal: controller.signal,
+    });
+    expect(calls[0].signal).toBe(controller.signal);
+  });
+});
+
+describe("usage", () => {
+  it("passes every token bucket the host reported to the router", async () => {
+    const { host } = llm({
+      usage: {
+        inputTokens: 100,
+        outputTokens: 10,
+        cacheReadTokens: 40,
+        cacheWriteTokens: 5,
+        totalTokens: 160,
+        costUsd: 0.002,
+      },
+    });
+    const outcome = await completeWithBoundModel(host, {
+      modelId: "acme/big",
+      system: "s",
+      user: "u",
+      outputSchema: SCHEMA,
+      maxOutputTokens: 64,
+    });
+    expect(outcome.usage).toEqual({
+      input_tokens: 100,
+      output_tokens: 10,
+      cache_read_tokens: 40,
+      cache_write_tokens: 5,
+      total_tokens: 160,
+      cost_usd: 0.002,
+    });
+    expect(outcome.responseModel).toBe("big-2026-09-01");
+    expect(outcome.stopReason).toBe("stop");
+    expect(outcome.execution).toEqual({ mode: "direct-provider", owner: "acme" });
+  });
+
+  it("reports an absent bucket as null rather than zero", async () => {
+    const { host } = llm({ usage: { inputTokens: 9 } });
+    const outcome = await completeWithBoundModel(host, {
+      modelId: "acme/big",
+      system: "s",
+      user: "u",
+      outputSchema: SCHEMA,
+      maxOutputTokens: 64,
+    });
+    expect(outcome.usage.output_tokens).toBeNull();
+    expect(outcome.usage.cost_usd).toBeNull();
+  });
+
+  const REQUEST = {
+    modelId: "acme/big",
+    system: "s",
+    user: "u",
+    outputSchema: SCHEMA,
+    maxOutputTokens: 64,
+  };
+
+  // OpenClaw 2026.9.5 hands over each bucket either absent or as a non-negative
+  // integer. Anything else is a malformed report: it must not reach the router
+  // looking like "not reported", where it would be charged as nothing.
+  it.each([
+    ["a negative output count", { inputTokens: 532, outputTokens: -5, totalTokens: 527 }],
+    ["a negative output count with no total", { inputTokens: 532, outputTokens: -5 }],
+    ["an output count that is a string", { inputTokens: 532, outputTokens: "134" }],
+    ["an output count that is NaN", { inputTokens: 532, outputTokens: Number.NaN }],
+    ["an infinite output count", { inputTokens: 532, outputTokens: Number.POSITIVE_INFINITY }],
+    ["a fractional output count", { inputTokens: 532, outputTokens: 134.5 }],
+    ["a negative total", { inputTokens: 532, outputTokens: 134, totalTokens: -1 }],
+    ["a non-numeric input count", { inputTokens: "532", outputTokens: 134 }],
+    ["a negative cache bucket", { inputTokens: 532, outputTokens: 134, cacheReadTokens: -40 }],
+    ["a boolean count", { inputTokens: 532, outputTokens: true }],
+    ["a negative cost", { inputTokens: 532, outputTokens: 134, costUsd: -0.01 }],
+  ])("refuses %s as model_usage_invalid, without echoing it", async (_label, usage) => {
+    const { host } = llm({ usage });
+    const failure = await completeWithBoundModel(host, REQUEST).catch((error) => error);
+    expect(failure).toBeInstanceOf(AgentBrowserError);
+    expect(failure.code).toBe("model_usage_invalid");
+    const said = `${failure.message} ${failure.detail ?? ""}`;
+    for (const value of Object.values(usage)) expect(said).not.toContain(String(value));
+  });
+
+  it.each([
+    ["OpenAI-like usage", { inputTokens: 532, outputTokens: 134, totalTokens: 666, costUsd: 0.001 }],
+    ["Ollama-like usage", { inputTokens: 532, outputTokens: 134 }],
+    ["a legitimately zero bucket", { inputTokens: 532, outputTokens: 0, cacheReadTokens: 0, totalTokens: 532 }],
+    ["a total-only report", { totalTokens: 666 }],
+  ])("passes %s through exactly", async (_label, usage) => {
+    const { host } = llm({ usage });
+    const outcome = await completeWithBoundModel(host, REQUEST);
+    expect(outcome.usage.input_tokens).toBe(usage.inputTokens ?? null);
+    expect(outcome.usage.output_tokens).toBe(usage.outputTokens ?? null);
+    expect(outcome.usage.total_tokens).toBe(usage.totalTokens ?? null);
+  });
+
+  it("reads an explicit null bucket as not reported, not as zero", async () => {
+    const { host } = llm({ usage: { inputTokens: 532, outputTokens: null, totalTokens: 666 } });
+    const outcome = await completeWithBoundModel(host, REQUEST);
+    expect(outcome.usage.output_tokens).toBeNull();
+    expect(outcome.usage.total_tokens).toBe(666);
+  });
+});
+
+describe("failures", () => {
+  it("names the operator opt-in an unauthorized model override needs", () => {
+    const error = asCompletionError(
+      Object.assign(new Error("cannot override the target model"), {
+        code: "LLM_COMPLETION_NOT_AUTHORIZED",
+      }),
+    );
+    expect(error).toBeInstanceOf(AgentBrowserError);
+    expect(error.code).toBe("model_call_not_authorized");
+    expect(error.detail).toContain("allowModelOverride");
+  });
+
+  it("maps the host's stable completion codes onto stable browser codes", () => {
+    const cases: Array<[string, string]> = [
+      ["LLM_COMPLETION_ABORTED", "model_call_cancelled"],
+      ["LLM_COMPLETION_TIMEOUT", "model_call_failed"],
+      ["LLM_RUNTIME_UNAVAILABLE", "model_call_failed"],
+      ["LLM_COMPLETION_FAILED", "model_call_failed"],
+      ["something-new", "model_call_failed"],
+    ];
+    for (const [code, expected] of cases) {
+      expect(asCompletionError(Object.assign(new Error("x"), { code })).code).toBe(expected);
+    }
+  });
+
+  it("never lets a raw provider error escape", async () => {
+    const { host } = llm({}, new Error("api.openai.example returned 401 for key sk-live-…"));
+    const failure = await completeWithBoundModel(host, {
+      modelId: "acme/big",
+      system: "s",
+      user: "u",
+      outputSchema: SCHEMA,
+      maxOutputTokens: 64,
+    }).catch((error) => error as AgentBrowserError);
+    expect(failure).toBeInstanceOf(AgentBrowserError);
+    expect(failure.code).toBe("model_call_failed");
+    // The view the page receives is bounded and typed; it carries no stack.
+    expect(failure.view().retryable).toBe(true);
+  });
+});
+
+describe("no other surface is used", () => {
+  it("calls exactly one host method per completion", async () => {
+    const complete = vi.fn(async () => ({
+      text: "{}",
+      provider: "acme",
+      model: "big",
+      usage: { inputTokens: 1, outputTokens: 1 },
+    }));
+    await completeWithBoundModel({ complete } as unknown as HostLlm, {
+      modelId: "acme/big",
+      system: "s",
+      user: "u",
+      outputSchema: SCHEMA,
+      maxOutputTokens: 8,
+    });
+    expect(complete).toHaveBeenCalledTimes(1);
+  });
+});

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "string",
+  "enum": [
+    "options_found",
+    "no_matching_flights",
+    "request_refused",
+    "request_not_supported",
+    "quoted",
+    "purchase_simulated",
+    "purchase_declined",
+    "answered",
+    "done"
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WebAir message",
+  "description": "One message of the conversation with WebAir, in your own words: a search, a question about the fares found, a quote of one of them, or the purchase of the open quote (the agent asks before it buys).",
+  "type": "object",
+  "properties": {
+    "message": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000,
+      "description": "What you want to say to WebAir.",
+      "examples": [
+        "Find me a flight from Boston to Zurich on 9 October under $900"
+      ]
+    }
+  },
+  "required": [
+    "message"
+  ],
+  "additionalProperties": false
+}

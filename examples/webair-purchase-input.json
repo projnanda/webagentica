@@ -1,0 +1,8 @@
+{
+  "request": "Simulate purchase of quote WAQ-C82CB5B08515FAE6.",
+  "booking": false,
+  "purchase": {
+    "quote_id": "WAQ-C82CB5B08515FAE6",
+    "fare_id": "WA101-20261009-STANDARD"
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "type": "object",
+  "properties": {
+    "request": {
+      "$ref": "input.schema.json"
+    },
+    "plan": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {},
+          "required": [],
+          "additionalProperties": false
+        },
+        {
+          "$ref": "plan.schema.json"
+        }
+      ]
+    },
+    "batches": {
+      "$ref": "batches.schema.json"
+    },
+    "perspectives": {
+      "$ref": "perspectives.schema.json"
+    },
+    "agenda": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {},
+          "required": [],
+          "additionalProperties": false
+        },
+        {
+          "$ref": "agenda.schema.json"
+        }
+      ]
+    },
+    "draft": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {},
+          "required": [],
+          "additionalProperties": false
+        },
+        {
+          "$ref": "draft.schema.json"
+        }
+      ]
+    }
+  },
+  "required": [
+    "request",
+    "plan",
+    "batches",
+    "perspectives",
+    "agenda",
+    "draft"
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,8 @@
+{
+  "request": "Prepare WA101 Standard for 9 October for me.",
+  "booking": true,
+  "purchase": {
+    "quote_id": "",
+    "fare_id": ""
+  }
+}

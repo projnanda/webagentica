@@ -1,0 +1,209 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Workflow state",
+  "type": "object",
+  "properties": {
+    "message": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000
+    },
+    "history": {
+      "$ref": "history.schema.json"
+    },
+    "quote_ref": {
+      "$ref": "booking-summary.schema.json"
+    },
+    "confirmation_ref": {
+      "$ref": "purchase-summary.schema.json"
+    },
+    "profile_used": {
+      "$ref": "profile-used.schema.json"
+    },
+    "plan": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "plan.schema.json"
+        }
+      ]
+    },
+    "profile": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "travel-preferences.schema.json"
+        }
+      ]
+    },
+    "search_origin": {
+      "$ref": "search-origin.schema.json"
+    },
+    "search_request": {
+      "$ref": "search-request.schema.json"
+    },
+    "search": {
+      "$ref": "search-outcome.schema.json"
+    },
+    "selection": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "selection.schema.json"
+        }
+      ]
+    },
+    "offered_flights": {
+      "$ref": "offered-flights.schema.json"
+    },
+    "offered_fares": {
+      "$ref": "offered-fares.schema.json"
+    },
+    "refusal": {
+      "$ref": "refusal.schema.json"
+    },
+    "fare_rules": {
+      "$ref": "fare-rules.schema.json"
+    },
+    "selected_booking_fare": {
+      "$ref": "booking-fare.schema.json"
+    },
+    "booking_fare": {
+      "$ref": "booking-fare.schema.json"
+    },
+    "payment": {
+      "$ref": "payment.schema.json"
+    },
+    "passenger": {
+      "$ref": "passenger.schema.json"
+    },
+    "booking_request": {
+      "$ref": "booking-request.schema.json"
+    },
+    "quote": {
+      "$ref": "quote.schema.json"
+    },
+    "purchase_request": {
+      "$ref": "purchase-request.schema.json"
+    },
+    "confirmation": {
+      "$ref": "confirmation.schema.json"
+    },
+    "booking_summary": {
+      "$ref": "booking-summary.schema.json"
+    },
+    "purchase_summary": {
+      "$ref": "purchase-summary.schema.json"
+    },
+    "purchase_result": {
+      "$ref": "purchase-result.schema.json"
+    },
+    "purchase_fares": {
+      "$ref": "fare-refs.schema.json"
+    },
+    "known_fares": {
+      "$ref": "fare-refs.schema.json"
+    },
+    "status": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "status.schema.json"
+        }
+      ]
+    },
+    "answer": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "answer.schema.json"
+        }
+      ]
+    },
+    "result": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "result.schema.json"
+        }
+      ]
+    },
+    "remember": {
+      "$ref": "remember.schema.json"
+    },
+    "quote_total": {
+      "$ref": "quote-total.schema.json"
+    },
+    "quote_total_input": {
+      "$ref": "quote-total-input.schema.json"
+    },
+    "offered_booking_fare": {
+      "$ref": "booking-fare.schema.json"
+    },
+    "purchase_decision": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "consent-decision.schema.json"
+        }
+      ]
+    },
+    "purchase_facts": {
+      "$ref": "purchase-facts.schema.json"
+    }
+  },
+  "required": [
+    "message",
+    "history",
+    "quote_ref",
+    "confirmation_ref",
+    "profile_used",
+    "plan",
+    "profile",
+    "search_origin",
+    "search_request",
+    "search",
+    "selection",
+    "offered_flights",
+    "offered_fares",
+    "refusal",
+    "fare_rules",
+    "selected_booking_fare",
+    "booking_fare",
+    "payment",
+    "passenger",
+    "booking_request",
+    "quote",
+    "purchase_request",
+    "confirmation",
+    "booking_summary",
+    "purchase_summary",
+    "purchase_result",
+    "purchase_fares",
+    "known_fares",
+    "status",
+    "answer",
+    "result",
+    "remember",
+    "quote_total",
+    "quote_total_input",
+    "offered_booking_fare",
+    "purchase_decision",
+    "purchase_facts"
+  ],
+  "additionalProperties": false
+}

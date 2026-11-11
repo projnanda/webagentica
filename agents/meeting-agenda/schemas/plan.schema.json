@@ -1,0 +1,15 @@
+{
+  "type": "object",
+  "properties": {
+    "focus": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "focus"
+  ],
+  "additionalProperties": false
+}

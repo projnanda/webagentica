@@ -1,0 +1,80 @@
+{
+  "type": "object",
+  "title": "Literature review task",
+  "description": "One bounded research question. Each run answers one question; a follow-up question is a new run.",
+  "properties": {
+    "question": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000,
+      "title": "Research question",
+      "description": "The question the review should answer, in one or two sentences.",
+      "examples": [
+        "What defenses have been proposed against prompt injection attacks on LLM-integrated applications?"
+      ]
+    },
+    "seeds": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "title": "Seed papers",
+      "description": "Optional titles, DOIs or arXiv ids to look up first. Seeds are search hints, not verified references.",
+      "default": []
+    },
+    "documents": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+      },
+      "title": "Documents",
+      "description": "Optional PDFs selected on this host, keyed by the DOI of the paper each one is. The package receives only opaque document ids, never a path.",
+      "default": {}
+    },
+    "mode": {
+      "enum": [
+        "fixture",
+        "live"
+      ],
+      "title": "Mode",
+      "description": "live for real research; fixture marks the result as a synthetic demonstration.",
+      "default": "live"
+    },
+    "use_profile": {
+      "type": "boolean",
+      "title": "Use my research profile",
+      "description": "Read the research profile you choose from your memory (interests, topics to avoid) to shape the search.",
+      "default": false
+    },
+    "keep_notes": {
+      "type": "boolean",
+      "title": "Keep agent notes",
+      "description": "Let this agent read its own short notes from earlier runs and keep new ones, which you can read and clear in Settings.",
+      "default": false
+    },
+    "reviewed_on": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+      "title": "Review date",
+      "description": "Today's date (YYYY-MM-DD). Given, the run proposes to remember this review; you accept, edit or reject it after the run.",
+      "default": null,
+      "examples": [
+        "2026-10-14"
+      ]
+    }
+  },
+  "required": [
+    "question",
+    "seeds",
+    "documents",
+    "mode",
+    "use_profile",
+    "keep_notes",
+    "reviewed_on"
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,15 @@
+{
+  "type": "object",
+  "properties": {
+    "candidates": {
+      "type": "array",
+      "items": {
+        "$ref": "candidate-ref.schema.json"
+      }
+    }
+  },
+  "required": [
+    "candidates"
+  ],
+  "additionalProperties": false
+}

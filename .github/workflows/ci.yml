@@ -1,0 +1,721 @@
+# Clean-install CI for WebAgents. Every job starts from a fresh checkout and installs its
+# dependencies from the public registries. Nothing here needs a model, a provider credential,
+# Ollama, a configured OpenClaw host, live Crossref, the hosted Citation Resolver or a signing
+# key: package runs use fixture mode, and the plugin tests drive a real control plane against
+# throwaway state. Live-provider tests stay opt-in (AGENTPKG_TEST_LIVE_MODEL,
+# AGENTPKG_TEST_OPENCLAW) and are skipped here. The Chrome Agent Browser's tests use fakes for
+# Chrome, providers and services; the conformance suite runs both runtimes in fixture mode.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  agentpkg:
+    name: agentpkg (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.13"]
+        # setup-python has no macOS build of 3.11 after 3.11.9, which predates
+        # CPython's ipaddress fixes (CVE-2024-4032) that the URL policy relies on.
+        # The 3.11 floor is tested on Ubuntu; macOS tests 3.12 instead.
+        exclude:
+          - os: macos-latest
+            python: "3.11"
+        include:
+          - os: macos-latest
+            python: "3.12"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install agentpkg as the README describes
+        run: |
+          python -m venv agentpkg/.venv
+          agentpkg/.venv/bin/python -m pip install -e './agentpkg[dev,compute]'
+          agentpkg/.venv/bin/agentpkg --version
+      - name: Install the Citation Resolver environment (the package/resolver schema contract test uses it)
+        run: |
+          python -m venv citation-resolver/.venv
+          citation-resolver/.venv/bin/python -m pip install -r citation-resolver/requirements.txt
+      - name: Lint
+        run: |
+          agentpkg/.venv/bin/python -m ruff check agentpkg
+          agentpkg/.venv/bin/python -m ruff format --check agentpkg
+      - name: Test suite (only the opt-in live tests may be skipped)
+        run: |
+          agentpkg/.venv/bin/python -m pytest agentpkg/tests -rs --junitxml="$RUNNER_TEMP/agentpkg.xml"
+          agentpkg/.venv/bin/python - "$RUNNER_TEMP/agentpkg.xml" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+          opt_in = {
+              ("tests.test_live_structured_output", "test_a_live_model_conforms_to_the_exact_screen_schema"),
+              ("tests.test_openclaw", "test_installed_openclaw_discovers_staged_skills"),
+          }
+          skipped = {
+              (case.get("classname"), case.get("name").split("[")[0])
+              for case in ET.parse(sys.argv[1]).getroot().iter("testcase")
+              if case.find("skipped") is not None
+          }
+          print("skipped:", sorted(skipped))
+          sys.exit(1 if skipped - opt_in else 0)
+          PY
+      - name: Offline acceptance scripts
+        run: |
+          for script in verify_workflow verify_browser verify_literature_022 \
+                        verify_literature_023 verify_literature_024 verify_literature_025 \
+                        verify_literature_026 verify_literature_027 \
+                        verify_webair verify_webair_discovery check_memory_spec \
+                        verify_compute verify_conversation verify_network \
+                        check_security_model check_protocol check_extension_privileges; do
+            report="$RUNNER_TEMP/$script.json"
+            # The scripts report failures in their JSON; some also exit 1, which under `bash -e` would
+            # abort before the report line below prints the problems, so the JSON check decides.
+            agentpkg/.venv/bin/python "scripts/$script.py" > "$report" || true
+            agentpkg/.venv/bin/python -c '
+          import json, sys
+          report = json.load(open(sys.argv[2]))
+          print(sys.argv[1], "passed:", report.get("passed"))
+          sys.exit(0 if report.get("passed") is True else 1)
+          ' "$script" "$report"
+          done
+
+  packages:
+    name: signed packages and distributions (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Build the wheel and sdist from source
+        run: |
+          python -m venv "$RUNNER_TEMP/build-env"
+          "$RUNNER_TEMP/build-env/bin/python" -m pip install 'build>=1.2,<2' 'setuptools==84.0.0'
+          SOURCE_DATE_EPOCH=1790965957 "$RUNNER_TEMP/build-env/bin/python" -m build \
+            --no-isolation --outdir "$RUNNER_TEMP/agentpkg-dist" agentpkg
+          ls -l "$RUNNER_TEMP/agentpkg-dist"
+      - name: Install the shipped wheel in a fresh environment
+        run: |
+          python -m venv "$RUNNER_TEMP/wheel-env"
+          # `[compute]`: WebAir 0.7.0 and Literature Review 0.2.9 run WebAssembly modules (T22).
+          # 0.6.0 (T23) adds conversation.v0; 0.7.0 (T25) adds network.v0, 0.7.1 (T26) its review's fixes;
+          # the wheel still runs every shipped package.
+          "$RUNNER_TEMP/wheel-env/bin/python" -m pip install 'dist/agentpkg-0.7.1-py3-none-any.whl[compute]'
+          cd "$RUNNER_TEMP"
+          wheel-env/bin/agentpkg --version
+          wheel-env/bin/python -c 'import agentpkg; assert "site-packages" in agentpkg.__file__, agentpkg.__file__'
+      - name: Release-tree checks (package identities, dist/ SHA-256 list, licenses, wheel = source)
+        run: |
+          "$RUNNER_TEMP/wheel-env/bin/python" scripts/check_release.py \
+            --built-wheel "$RUNNER_TEMP/agentpkg-dist/agentpkg-0.7.1-py3-none-any.whl"
+      - name: Verify the signed packages with the installed wheel
+        run: |
+          agentpkg="$RUNNER_TEMP/wheel-env/bin/agentpkg"
+          "$agentpkg" verify dist/meeting-agenda.agent.pkg \
+            --trust-key examples/keys/meeting-agenda-publisher.pub.pem > "$RUNNER_TEMP/verify-agenda.json"
+          "$agentpkg" verify dist/literature-review.agent.pkg \
+            --trust-key examples/keys/literature-review-publisher.pub.pem > "$RUNNER_TEMP/verify-review.json"
+          "$agentpkg" verify dist/literature-review-0.2.6.agent.pkg \
+            --trust-key examples/keys/literature-review-publisher.pub.pem > "$RUNNER_TEMP/verify-review-026.json"
+          "$agentpkg" verify dist/literature-review-0.2.7.agent.pkg \
+            --trust-key examples/keys/literature-review-publisher.pub.pem > "$RUNNER_TEMP/verify-review-027.json"
+          "$agentpkg" verify dist/literature-review-0.2.8.agent.pkg \
+            --trust-key examples/keys/literature-review-publisher.pub.pem > "$RUNNER_TEMP/verify-review-028.json"
+          "$agentpkg" verify dist/literature-review-0.2.9.agent.pkg \
+            --trust-key examples/keys/literature-review-publisher.pub.pem > "$RUNNER_TEMP/verify-review-029.json"
+          "$agentpkg" verify dist/webair.agent.pkg \
+            --trust-key examples/keys/webair-publisher.pub.pem > "$RUNNER_TEMP/verify-webair.json"
+          "$agentpkg" verify dist/webair-0.3.0.agent.pkg \
+            --trust-key examples/keys/webair-publisher.pub.pem > "$RUNNER_TEMP/verify-webair-030.json"
+          "$agentpkg" verify dist/webair-0.4.0.agent.pkg \
+            --trust-key examples/keys/webair-publisher.pub.pem > "$RUNNER_TEMP/verify-webair-040.json"
+          "$agentpkg" verify dist/webair-0.5.0.agent.pkg \
+            --trust-key examples/keys/webair-publisher.pub.pem > "$RUNNER_TEMP/verify-webair-050.json"
+          "$agentpkg" verify dist/webair-0.6.0.agent.pkg \
+            --trust-key examples/keys/webair-publisher.pub.pem > "$RUNNER_TEMP/verify-webair-060.json"
+          "$agentpkg" verify dist/webair-0.7.0.agent.pkg \
+            --trust-key examples/keys/webair-publisher.pub.pem > "$RUNNER_TEMP/verify-webair-070.json"
+          "$agentpkg" verify dist/webair-0.8.0.agent.pkg \
+            --trust-key examples/keys/webair-publisher.pub.pem > "$RUNNER_TEMP/verify-webair-080.json"
+          "$agentpkg" verify dist/travel-network-0.1.0.agent.pkg \
+            --trust-key examples/keys/travel-network-publisher.pub.pem > "$RUNNER_TEMP/verify-travel-network.json"
+          python - "$RUNNER_TEMP" <<'PY'
+          import json, sys
+          from pathlib import Path
+          expected = {
+              "verify-agenda.json": ("org.webagents.meeting-agenda", "0.2.2",
+                  "sha256:2bcc374a7fe18e50622042b7d0375fcb24eb3607879a236f9f3c3ede1922c5c4"),
+              "verify-review.json": ("org.webagents.literature-review", "0.2.5",
+                  "sha256:c5ca9763f9fc71253298ca381ec14c4d7432009c74dacc69df6344b71de05232"),
+              "verify-review-026.json": ("org.webagents.literature-review", "0.2.6",
+                  "sha256:c5ca9763f9fc71253298ca381ec14c4d7432009c74dacc69df6344b71de05232"),
+              "verify-review-027.json": ("org.webagents.literature-review", "0.2.7",
+                  "sha256:c5ca9763f9fc71253298ca381ec14c4d7432009c74dacc69df6344b71de05232"),
+              "verify-review-028.json": ("org.webagents.literature-review", "0.2.8",
+                  "sha256:c5ca9763f9fc71253298ca381ec14c4d7432009c74dacc69df6344b71de05232"),
+              "verify-review-029.json": ("org.webagents.literature-review", "0.2.9",
+                  "sha256:c5ca9763f9fc71253298ca381ec14c4d7432009c74dacc69df6344b71de05232"),
+              "verify-webair.json": ("org.webagents.webair", "0.1.0",
+                  "sha256:2e53accec575b37bf16c189e03cd3a6b2f2cfae2339ff05361bf585dc3d4a20b"),
+              "verify-webair-030.json": ("org.webagents.webair", "0.3.0",
+                  "sha256:2e53accec575b37bf16c189e03cd3a6b2f2cfae2339ff05361bf585dc3d4a20b"),
+              "verify-webair-040.json": ("org.webagents.webair", "0.4.0",
+                  "sha256:2e53accec575b37bf16c189e03cd3a6b2f2cfae2339ff05361bf585dc3d4a20b"),
+              "verify-webair-050.json": ("org.webagents.webair", "0.5.0",
+                  "sha256:2e53accec575b37bf16c189e03cd3a6b2f2cfae2339ff05361bf585dc3d4a20b"),
+              "verify-webair-060.json": ("org.webagents.webair", "0.6.0",
+                  "sha256:2e53accec575b37bf16c189e03cd3a6b2f2cfae2339ff05361bf585dc3d4a20b"),
+              "verify-webair-070.json": ("org.webagents.webair", "0.7.0",
+                  "sha256:2e53accec575b37bf16c189e03cd3a6b2f2cfae2339ff05361bf585dc3d4a20b"),
+              "verify-webair-080.json": ("org.webagents.webair", "0.8.0",
+                  "sha256:2e53accec575b37bf16c189e03cd3a6b2f2cfae2339ff05361bf585dc3d4a20b"),
+              "verify-travel-network.json": ("org.webagents.travel-network", "0.1.0",
+                  "sha256:27c903afe0b78ae7e27736bfbddafd6f8b6a58b3c26f0bce9507f70aeff762ef"),
+          }
+          for name, (package_id, version, fingerprint) in expected.items():
+              report = json.loads((Path(sys.argv[1]) / name).read_text())
+              print(json.dumps(report))
+              assert report["valid"] is True
+              assert (report["package_id"], report["version"]) == (package_id, version)
+              assert report["key_fingerprint"] == fingerprint
+          PY
+          # A valid signature by a key the host did not pin must be refused.
+          if "$agentpkg" verify dist/literature-review.agent.pkg \
+               --trust-key examples/keys/meeting-agenda-publisher.pub.pem > /dev/null 2>&1; then
+            echo "verification accepted an unpinned key" >&2
+            exit 1
+          fi
+      - name: Run the packages in fixture mode with the installed wheel (README quickstart)
+        run: |
+          agentpkg="$RUNNER_TEMP/wheel-env/bin/agentpkg"
+          "$agentpkg" run dist/meeting-agenda.agent.pkg --mode fixture \
+            --grants examples/meeting-agenda-grants.json \
+            --out "$RUNNER_TEMP/my-agenda" > "$RUNNER_TEMP/run-agenda.json"
+          "$agentpkg" run dist/literature-review.agent.pkg --mode fixture \
+            --grants examples/literature-review-grants.json \
+            --approve-tool scholarly-search --approve-tool citation-resolver --approve-tool paper-reader \
+            --out "$RUNNER_TEMP/my-review" > "$RUNNER_TEMP/run-review.json"
+          "$agentpkg" run dist/literature-review-0.2.6.agent.pkg --mode fixture \
+            --grants examples/literature-review-grants.json \
+            --approve-tool scholarly-search --approve-tool citation-resolver --approve-tool paper-reader \
+            --out "$RUNNER_TEMP/my-review-026" > "$RUNNER_TEMP/run-review-026.json"
+          # Literature Review 0.2.7 uses answer checks: the 0.3.0 wheel above runs it (T15).
+          "$agentpkg" run dist/literature-review-0.2.7.agent.pkg --mode fixture \
+            --grants examples/literature-review-grants.json \
+            --approve-tool scholarly-search --approve-tool citation-resolver --approve-tool paper-reader \
+            --out "$RUNNER_TEMP/my-review-027" > "$RUNNER_TEMP/run-review-027.json"
+          # Literature Review 0.2.8 uses memory.v0 (runtime minimum 0.4.0): its memory-on fixture
+          # input reads the replayed research profile and proposes one review (proposals.json).
+          "$agentpkg" run dist/literature-review-0.2.8.agent.pkg --mode fixture \
+            --grants examples/literature-review-0.2.8-grants.json \
+            --input examples/literature-review-0.2.8-memory-input.json \
+            --approve-tool scholarly-search --approve-tool citation-resolver --approve-tool paper-reader \
+            --approve-tool research.profile --approve-tool agent-notes.read --approve-tool agent-notes.write \
+            --out "$RUNNER_TEMP/my-review-028" > "$RUNNER_TEMP/run-review-028.json"
+          # Literature Review 0.2.9 deduplicates its candidates in a WebAssembly module (compute.v0,
+          # runtime minimum 0.5.0); the module runs for real in fixture mode.
+          "$agentpkg" run dist/literature-review-0.2.9.agent.pkg --mode fixture \
+            --grants examples/literature-review-0.2.9-grants.json \
+            --input examples/literature-review-0.2.8-memory-input.json \
+            --approve-tool scholarly-search --approve-tool citation-resolver --approve-tool paper-reader \
+            --approve-tool research.profile --approve-tool agent-notes.read --approve-tool agent-notes.write \
+            --out "$RUNNER_TEMP/my-review-029" > "$RUNNER_TEMP/run-review-029.json"
+          "$agentpkg" run dist/webair.agent.pkg --mode fixture \
+            --grants examples/webair-grants.json \
+            --approve-tool search-flights --approve-tool get-fare-rules \
+            --out "$RUNNER_TEMP/my-webair" > "$RUNNER_TEMP/run-webair.json"
+          # WebAir 0.3.0 declares personal.read permissions; a search needs none of them.
+          "$agentpkg" run dist/webair-0.3.0.agent.pkg --mode fixture \
+            --grants examples/webair-0.2.0-grants.json \
+            --approve-tool search-flights --approve-tool get-fare-rules \
+            --out "$RUNNER_TEMP/my-webair-030" > "$RUNNER_TEMP/run-webair-030.json"
+          # WebAir 0.4.0 adds publisher-declared profiles, a noncritical extension agentpkg ignores.
+          "$agentpkg" run dist/webair-0.4.0.agent.pkg --mode fixture \
+            --grants examples/webair-0.2.0-grants.json \
+            --approve-tool search-flights --approve-tool get-fare-rules \
+            --out "$RUNNER_TEMP/my-webair-040" > "$RUNNER_TEMP/run-webair-040.json"
+          # WebAir 0.5.0 answers a request without a departure airport instead of failing (T9).
+          "$agentpkg" run dist/webair-0.5.0.agent.pkg --mode fixture \
+            --grants examples/webair-0.2.0-grants.json \
+            --approve-tool search-flights --approve-tool get-fare-rules \
+            --out "$RUNNER_TEMP/my-webair-050" > "$RUNNER_TEMP/run-webair-050.json"
+          # WebAir 0.6.0 reads the travel profile from memory (memory.v0); a search proposes nothing.
+          "$agentpkg" run dist/webair-0.6.0.agent.pkg --mode fixture \
+            --grants examples/webair-0.6.0-grants.json \
+            --approve-tool search-flights --approve-tool get-fare-rules \
+            --out "$RUNNER_TEMP/my-webair-060" > "$RUNNER_TEMP/run-webair-060.json"
+          # WebAir 0.7.0 recomputes every fare total WebAir states in its fares module (compute.v0).
+          "$agentpkg" run dist/webair-0.7.0.agent.pkg --mode fixture \
+            --grants examples/webair-0.7.0-grants.json \
+            --approve-tool search-flights --approve-tool get-fare-rules \
+            --out "$RUNNER_TEMP/my-webair-070" > "$RUNNER_TEMP/run-webair-070.json"
+          python - "$RUNNER_TEMP" <<'PY'
+          import json, sys
+          from pathlib import Path
+          temp = Path(sys.argv[1])
+          exports = {
+              "agenda": ["agenda.json"],
+              "review": ["related-work.md", "bibliography.json", "evidence-table.json",
+                         "unresolved.json", "verification.json"],
+              "review-026": ["related-work.md", "bibliography.json", "evidence-table.json",
+                             "unresolved.json", "verification.json"],
+              "review-027": ["related-work.md", "papers-found.json", "bibliography.json",
+                             "evidence-table.json", "unresolved.json", "verification.json"],
+              "review-028": ["related-work.md", "papers-found.json", "bibliography.json",
+                             "evidence-table.json", "unresolved.json", "verification.json",
+                             "proposals.json"],
+              "review-029": ["related-work.md", "papers-found.json", "bibliography.json",
+                             "evidence-table.json", "unresolved.json", "verification.json",
+                             "proposals.json"],
+              "webair": ["answer.md", "search.json", "fare-rules.json", "booking.json"],
+              "webair-030": ["answer.md", "search.json", "fare-rules.json", "booking.json"],
+              "webair-040": ["answer.md", "search.json", "fare-rules.json", "booking.json"],
+              "webair-050": ["answer.md", "search.json", "fare-rules.json", "booking.json"],
+              "webair-060": ["answer.md", "search.json", "fare-rules.json", "booking.json",
+                             "proposals.json"],
+              "webair-070": ["answer.md", "search.json", "fare-rules.json", "booking.json",
+                             "proposals.json"],
+          }
+          for name, declared in exports.items():
+              report = json.loads((temp / f"run-{name}.json").read_text())
+              print(name, report["status"], "passed:", report["passed"])
+              assert report["status"] == "completed" and report["passed"] is True
+              for file in ["result.json", "audit.json", "usage.json", "provenance.json", *declared]:
+                  assert (temp / f"my-{name}" / file).is_file(), file
+          PY
+          # WebAir 0.8.0 is a conversation (conversation.v0): `converse` replays its three-turn
+          # fixture (searches only) and the package's end rule ends it; `run` refuses it.
+          "$agentpkg" converse dist/webair-0.8.0.agent.pkg --mode fixture \
+            --grants examples/webair-0.8.0-grants.json \
+            --approve-tool search-flights --approve-tool get-fare-rules \
+            --trust-key examples/keys/webair-publisher.pub.pem \
+            --out "$RUNNER_TEMP/my-webair-080" > "$RUNNER_TEMP/converse-webair-080.json"
+          python - "$RUNNER_TEMP" <<'PY'
+          import json, sys
+          from pathlib import Path
+          temp = Path(sys.argv[1])
+          report = json.loads((temp / "converse-webair-080.json").read_text())
+          print("webair-080", report["status"], "passed:", report["passed"], "ended:", report["ended"]["reason"])
+          assert report["status"] == "completed" and report["passed"] is True
+          assert report["ended"]["reason"] == "package" and len(report["turns"]) == 3
+          out = temp / "my-webair-080"
+          for file in ["transcript.json", "state.json", "audit.json", "usage.json", "provenance.json"]:
+              assert (out / file).is_file(), file
+          for turn in ["turn-001", "turn-002", "turn-003"]:
+              for file in ["result.json", "audit.json", "usage.json", "provenance.json", "answer.md",
+                           "search.json", "fare-rules.json", "booking.json", "proposals.json"]:
+                  assert (out / turn / file).is_file(), f"{turn}/{file}"
+          PY
+          if "$agentpkg" run dist/webair-0.8.0.agent.pkg --mode fixture \
+               --grants examples/webair-0.8.0-grants.json \
+               --out "$RUNNER_TEMP/webair-080-run" > /dev/null 2>&1; then
+            echo "run accepted a conversational package" >&2
+            exit 1
+          fi
+          # The network-test package (network.v0, T25): the installed wheel runs its fixture walk
+          # (Desk, Lookup, Desk, Writer, Desk, done) and records every handoff.
+          "$agentpkg" run examples/network/network-test.agent.pkg --mode fixture \
+            --grants examples/network/network-test-grants.json --approve-tool lookup \
+            --trust-key examples/keys/network-test-publisher.pub.pem \
+            --out "$RUNNER_TEMP/my-network-test" > "$RUNNER_TEMP/run-network-test.json"
+          python - "$RUNNER_TEMP" <<'PY'
+          import json, sys
+          from pathlib import Path
+          temp = Path(sys.argv[1])
+          report = json.loads((temp / "run-network-test.json").read_text())
+          print("network-test", report["status"], "passed:", report["passed"])
+          assert report["status"] == "completed" and report["passed"] is True
+          audit = json.loads((temp / "my-network-test" / "audit.json").read_text())
+          activated = [e["role"] for e in audit if e["action"] == "network.activated"]
+          assert activated == ["Desk", "Lookup", "Desk", "Writer", "Desk"], activated
+          assert len([e for e in audit if e["action"] == "route.decided"]) == 5
+          for file in ["result.json", "audit.json", "usage.json", "provenance.json", "answer.json", "reply.txt"]:
+              assert (temp / "my-network-test" / file).is_file(), file
+          PY
+          # The shipped travel network (network.v0, T26): its fixture walk is the full tour, which
+          # attains the envelope the package states.
+          "$agentpkg" run dist/travel-network-0.1.0.agent.pkg --mode fixture \
+            --grants examples/network/travel-network-grants.json \
+            --approve-tool search-flights --approve-tool search-hotels --approve-tool check-calendar \
+            --trust-key examples/keys/travel-network-publisher.pub.pem \
+            --out "$RUNNER_TEMP/my-travel-network" > "$RUNNER_TEMP/run-travel-network.json"
+          python - "$RUNNER_TEMP" <<'PY'
+          import json, sys
+          from pathlib import Path
+          temp = Path(sys.argv[1])
+          report = json.loads((temp / "run-travel-network.json").read_text())
+          print("travel-network", report["status"], "passed:", report["passed"])
+          assert report["status"] == "completed" and report["passed"] is True
+          audit = json.loads((temp / "my-travel-network" / "audit.json").read_text())
+          activated = [e["role"] for e in audit if e["action"] == "network.activated"]
+          assert activated == ["FrontMan", "Flights", "FrontMan", "Hotel", "FrontMan", "Calendar", "FrontMan"], activated
+          started = next(e for e in audit if e["action"] == "network.started")
+          assert started["bound"]["max_hops"] == 6 and started["bound"]["tokens"] == 48000, started["bound"]
+          for file in ["result.json", "audit.json", "usage.json", "provenance.json", "plan.json", "plan.txt"]:
+              assert (temp / "my-travel-network" / file).is_file(), file
+          PY
+          # Each declared tool needs its own approval; a permission grant is not one.
+          if "$agentpkg" run dist/literature-review.agent.pkg --mode fixture \
+               --grants examples/literature-review-grants.json \
+               --out "$RUNNER_TEMP/unapproved" > /dev/null 2>&1; then
+            echo "a run without tool approvals was accepted" >&2
+            exit 1
+          fi
+      - name: Keep the CI-built distributions
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: agentpkg-dist
+          path: ${{ runner.temp }}/agentpkg-dist
+          retention-days: 14
+
+  webair:
+    name: WebAir demo origin and its package contract (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install (the requirements name ./agentpkg relative to the repository root)
+        run: |
+          python -m venv demo/webair/.venv
+          demo/webair/.venv/bin/python -m pip install -r demo/webair/requirements-dev.txt
+      - name: Lint
+        working-directory: demo/webair
+        run: |
+          .venv/bin/ruff check .
+          .venv/bin/ruff format --check .
+      - name: Tests, including the origin/package contract (no test may be skipped)
+        working-directory: demo/webair
+        run: |
+          .venv/bin/python -m pytest -rs -p no:cacheprovider --junitxml="$RUNNER_TEMP/webair.xml"
+          .venv/bin/python - "$RUNNER_TEMP/webair.xml" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+          suites = ET.parse(sys.argv[1]).getroot()
+          suites = [suites] if suites.tag == "testsuite" else list(suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          print("tests:", sum(int(s.get("tests", 0)) for s in suites), "skipped:", skipped)
+          sys.exit(1 if skipped else 0)
+          PY
+      - name: The package's generated schemas, fixture and examples are current
+        working-directory: demo/webair
+        run: .venv/bin/python -m publisher check
+
+  plugin:
+    name: Agent Browser plugin (${{ matrix.os }}, Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: ["24", "26"]
+    defaults:
+      run:
+        shell: bash
+        working-directory: openclaw-agent-browser
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install agentpkg (the integration tests spawn agentpkg/.venv/bin/agentpkg)
+        working-directory: .
+        run: |
+          python -m venv agentpkg/.venv
+          agentpkg/.venv/bin/python -m pip install -e './agentpkg[compute]'
+          test -x agentpkg/.venv/bin/agentpkg
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+          # npm's download cache only; `npm ci` still installs exactly package-lock.json.
+          cache: npm
+          cache-dependency-path: openclaw-agent-browser/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Tests (no test may be skipped)
+        run: |
+          npx vitest run --reporter=default --reporter=json --outputFile=vitest-report.json
+          node -e '
+            const r = JSON.parse(require("node:fs").readFileSync("vitest-report.json", "utf8"));
+            console.log({ total: r.numTotalTests, passed: r.numPassedTests,
+                          failed: r.numFailedTests, skipped: r.numPendingTests, todo: r.numTodoTests });
+            process.exit(r.success && r.numFailedTests === 0 && r.numPendingTests === 0 && r.numTodoTests === 0 ? 0 : 1);
+          '
+      - name: Build, validate and pack
+        run: |
+          npm run build
+          npm run validate
+          npm run pack
+      - name: Inspect the packed artifact
+        run: |
+          tar -tzf agent-browser.tgz | sort | tee "$RUNNER_TEMP/agent-browser.contents"
+          # Exactly the manifest, package.json and the bundled entry points: no sources,
+          # node_modules, maps or local files.
+          unexpected=$(grep -v -E '^package/(|dist/|dist/control-ui/|dist/control-ui/[0-9a-f]{64}/|package\.json|openclaw\.plugin\.json|dist/index\.js|dist/control-ui/[0-9a-f]{64}/index\.(js|css))$' \
+            "$RUNNER_TEMP/agent-browser.contents" || true)
+          if [ -n "$unexpected" ]; then
+            echo "unexpected entries in agent-browser.tgz:" >&2
+            echo "$unexpected" >&2
+            exit 1
+          fi
+      - name: Install the artifact into a throwaway OpenClaw configuration
+        run: npm run verify
+
+  chrome-agent-browser:
+    name: Chrome Agent Browser (${{ matrix.os }}, Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: ["24", "26"]
+    defaults:
+      run:
+        shell: bash
+        working-directory: chrome-agent-browser
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install agentpkg (the fixture-parity test runs agentpkg/.venv/bin/agentpkg)
+        working-directory: .
+        run: |
+          python -m venv agentpkg/.venv
+          agentpkg/.venv/bin/python -m pip install -e './agentpkg[compute]'
+          test -x agentpkg/.venv/bin/agentpkg
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: chrome-agent-browser/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Typecheck (the core compiles with no DOM, Node or Chrome types)
+        run: npm run typecheck
+      - name: Tests (no test may be skipped)
+        run: |
+          npx vitest run --reporter=default --reporter=json --outputFile="$RUNNER_TEMP/chrome-vitest.json"
+          node -e '
+            const r = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+            console.log({ total: r.numTotalTests, passed: r.numPassedTests,
+                          failed: r.numFailedTests, skipped: r.numPendingTests, todo: r.numTodoTests });
+            process.exit(r.success && r.numFailedTests === 0 && r.numPendingTests === 0 && r.numTodoTests === 0 ? 0 : 1);
+          ' "$RUNNER_TEMP/chrome-vitest.json"
+      - name: Build, pack and check the extension zip
+        run: |
+          npm run build
+          npm run pack
+          npm run check-pack
+          cat dist/chrome-agent-browser-*.contents.txt
+      - name: The same sources pack to the same bytes
+        run: |
+          first=$(node -e 'process.stdout.write(require("node:crypto").createHash("sha256").update(require("node:fs").readFileSync(process.argv[1])).digest("hex"))' dist/chrome-agent-browser-*.zip)
+          npm run build > /dev/null
+          npm run pack > /dev/null
+          second=$(node -e 'process.stdout.write(require("node:crypto").createHash("sha256").update(require("node:fs").readFileSync(process.argv[1])).digest("hex"))' dist/chrome-agent-browser-*.zip)
+          echo "first $first"; echo "second $second"
+          test "$first" = "$second"
+      - name: Keep the packed extension
+        if: matrix.os == 'ubuntu-latest' && matrix.node == '26'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: chrome-agent-browser-extension
+          path: |
+            chrome-agent-browser/dist/chrome-agent-browser-*.zip
+            chrome-agent-browser/dist/chrome-agent-browser-*.contents.txt
+          retention-days: 14
+
+  native-helper:
+    # The optional macOS helper and installer (T17, D-201…D-204): the helper's swift-testing suite,
+    # its universal build and smoke test, and the installer built and checked without installing.
+    name: Native helper and macOS installer
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+      - name: Helper tests (swift-testing)
+        working-directory: native-helper
+        run: swift test
+      - name: Universal build and smoke test
+        working-directory: native-helper
+        run: |
+          scripts/build.sh
+          node scripts/smoke.mjs dist/webagents-helper
+      - name: Installer dry run, build and checks
+        run: |
+          installer/macos/dry-run.sh
+          pkg=$(installer/macos/build-pkg.sh --helper native-helper/dist/webagents-helper | tail -n 1)
+          installer/macos/test-installer.sh "$pkg"
+
+  conformance:
+    name: cross-runtime conformance suite (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "26"
+          cache: npm
+          cache-dependency-path: chrome-agent-browser/package-lock.json
+      - name: Install agentpkg and build the Chrome core
+        run: |
+          python -m venv agentpkg/.venv
+          agentpkg/.venv/bin/python -m pip install -e './agentpkg[compute]'
+          (cd chrome-agent-browser && npm ci && npm run build)
+      - name: Run both runtimes on the shipped packages and the negative suite
+        # Fixture mode and control-plane scenarios only: no model, network or credential.
+        run: node conformance/run.mjs --out "$RUNNER_TEMP/conformance"
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: conformance-report-${{ matrix.os }}
+          path: ${{ runner.temp }}/conformance
+          retention-days: 30
+
+  citation-resolver:
+    name: Citation Resolver (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash
+        working-directory: citation-resolver
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -r requirements-dev.txt
+      - name: Lint
+        run: |
+          .venv/bin/python -m ruff check .
+          .venv/bin/python -m ruff format --check .
+      - name: Tests (mocked upstream services)
+        run: .venv/bin/python -m pytest -rs
+
+  experiments:
+    name: paper experiments' test suites (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "26"
+          cache: npm
+          cache-dependency-path: |
+            openclaw-agent-browser/package-lock.json
+            chrome-agent-browser/package-lock.json
+      - name: Install agentpkg, build the plugin, install the Chrome core's toolchain
+        # catalog v2 (T30) bundles its Node driver over a private copy of the Chrome core with
+        # the core's own esbuild and type-checks it with the core's TypeScript; overhead v2 (T38)
+        # bundles its Node benchmark over the core the same way.
+        run: |
+          python -m venv agentpkg/.venv
+          agentpkg/.venv/bin/python -m pip install -e './agentpkg[dev,compute]'
+          # The campaign infrastructure (T31): WebAir's origin and the framework baseline.
+          agentpkg/.venv/bin/python -m pip install -r experiments/campaigns/requirements.txt
+          (cd openclaw-agent-browser && npm ci && npm run build)
+          (cd chrome-agent-browser && npm ci)
+      - name: Tests (no test may be skipped)
+        # One pytest process per experiment: each puts its own directory first on
+        # sys.path, and the experiments have `analyze` modules of their own.
+        run: |
+          for experiment in contract_overhead contract_enforcement contract_enforcement/catalog_v2 conformance_report campaigns; do
+            agentpkg/.venv/bin/python -m pytest "experiments/$experiment/tests" -rs \
+              --junitxml="$RUNNER_TEMP/${experiment//\//_}.xml"
+            agentpkg/.venv/bin/python - "$RUNNER_TEMP/${experiment//\//_}.xml" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+          suites = ET.parse(sys.argv[1]).getroot()
+          suites = [suites] if suites.tag == "testsuite" else list(suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          print(sys.argv[1], "tests:", sum(int(s.get("tests", 0)) for s in suites), "skipped:", skipped)
+          sys.exit(1 if skipped else 0)
+          PY
+          done

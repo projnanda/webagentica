@@ -1,0 +1,24 @@
+{
+  "spec_version": "0.1",
+  "id": "prepare-booking",
+  "version": "0.2.0",
+  "description": "WebAir semantic API: quote one fare for the passenger identity the person granted for this run, supplied by the host and sent to WebAir only in this call. Reserves nothing, stores nothing, charges nothing.",
+  "execution": "remote",
+  "binding": "webair.prepare_booking",
+  "endpoint": "https://webagents-webair-production.up.railway.app/api/v1/prepare_booking",
+  "method": "POST",
+  "input_schema": "schemas/api/prepare_booking.input.schema.json",
+  "output_schema": "schemas/api/prepare_booking.output.schema.json",
+  "permissions": [
+    "network.webair",
+    "identity.passenger"
+  ],
+  "domains": [
+    "webagents-webair-production.up.railway.app"
+  ],
+  "timeout_seconds": 20,
+  "retries": 0,
+  "side_effects": "read",
+  "approval_required": true,
+  "extensions": {}
+}

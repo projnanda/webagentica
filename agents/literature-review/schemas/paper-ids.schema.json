@@ -1,0 +1,6 @@
+{
+  "type": "array",
+  "items": {
+    "$ref": "paper-id.schema.json"
+  }
+}

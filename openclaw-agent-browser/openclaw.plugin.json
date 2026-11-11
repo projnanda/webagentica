@@ -1,0 +1,213 @@
+{
+  "id": "agent-browser",
+  "name": "Agent Browser",
+  "description": "Open, inspect and authorize signed agent packages through the local agentpkg control plane, then run a ready workflow.v0 run plan from the page: the package's own graph executes on the model its run plan bound, re-verified before it starts, with live progress, cancellation and inspectable artifacts.",
+  "version": "0.1.0",
+  "categories": [
+    "developer-tools"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "agentpkgPath": {
+        "type": "string",
+        "description": "Absolute path to the agentpkg executable that provides `agentpkg browser-serve`."
+      },
+      "localPackages": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "roots": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+              "type": "string"
+            },
+            "description": "Absolute directories the Agent Browser may open .agent.pkg files from."
+          },
+          "includeWorkspace": {
+            "type": "boolean",
+            "description": "Also allow the OpenClaw workspace directory. Defaults to true."
+          }
+        }
+      },
+      "localFiles": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "roots": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+              "type": "string"
+            },
+            "description": "Absolute directories an operator may select PDFs from for a run. Empty by default; the workspace is never implied. A selected file is copied once into private storage and reaches a package only as an opaque id."
+          }
+        }
+      },
+      "sessionTtlSeconds": {
+        "type": "integer",
+        "minimum": 60,
+        "maximum": 86400,
+        "description": "Package session lifetime in the control plane."
+      },
+      "maxSessions": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 32,
+        "description": "Maximum concurrently open package sessions."
+      },
+      "execution": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Trusted host bounds for one run. Each one can only lower what a package already declares; none of them can raise a package's own budget.",
+        "properties": {
+          "totalTokens": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10000000,
+            "description": "Upper bound on total tokens for one run."
+          },
+          "maxRemoteCalls": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10000,
+            "description": "Upper bound on remote calls for one run."
+          },
+          "maxParallelWorkers": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 64,
+            "description": "Upper bound on simultaneously active workers."
+          },
+          "maxOutputTokensPerCall": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200000,
+            "description": "Ceiling on one call's output cap. A graph node asking for more is refused; its declared cap is never silently lowered."
+          },
+          "runTimeoutSeconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 86400,
+            "description": "Upper bound on a run's wall-clock time, tightening the graph deadline."
+          },
+          "modelCallTimeoutSeconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 3600,
+            "description": "Upper bound on one model completion, including time queued at the model server (default 300). Raise it for a local server that decodes one request at a time; graph node timeouts still bound every call."
+          },
+          "requireVerifiedHostRuntime": {
+            "type": "boolean",
+            "description": "Refuse to run on an OpenClaw release this project's token accounting was not verified against. Defaults to true."
+          },
+          "maxCallsPerTool": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10000,
+            "description": "Ceiling on how often one run may call any one tool. Lowers a package's own per-tool cap; it can never raise one."
+          },
+          "maxToolResponseBytes": {
+            "type": "integer",
+            "minimum": 1024,
+            "maximum": 4194304,
+            "description": "Ceiling on one tool response, applied to every binding's own limit."
+          }
+        }
+      },
+      "tools": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Which tool implementations this host offers. A package declares what it needs; these entries say what this host will actually run for it. Configuration can disable, relabel, retarget or bound a built-in implementation; it cannot add one, because a registry entry is a claim that code in this plugin can serve it. An operator bindings file can add entries of the service-neutral JSON POST adapter only.",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether this host brokers package tools at all. Defaults to true; false means no package that declares a tool can run here."
+          },
+          "bindings": {
+            "type": "array",
+            "maxItems": 32,
+            "description": "Per-tool configuration, matched to a built-in implementation by toolId.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "toolId"
+              ],
+              "properties": {
+                "toolId": {
+                  "type": "string",
+                  "maxLength": 200,
+                  "description": "The declared tool id this entry configures."
+                },
+                "enabled": {
+                  "type": "boolean",
+                  "description": "Disable this implementation."
+                },
+                "origin": {
+                  "type": "string",
+                  "description": "HTTPS origin on port 443, with no path, query or credentials. Remote bindings only. A package whose declared domains do not cover it is refused by the control plane rather than redirected here."
+                },
+                "path": {
+                  "type": "string",
+                  "description": "Absolute request path. Remote bindings only."
+                },
+                "method": {
+                  "enum": [
+                    "GET",
+                    "POST"
+                  ],
+                  "description": "Remote bindings only."
+                },
+                "timeoutSeconds": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 120
+                },
+                "displayName": {
+                  "type": "string",
+                  "maxLength": 200
+                },
+                "credentialEnv": {
+                  "type": "string",
+                  "description": "Name of an environment variable this host reads at call time and sends as a bearer token. The value never reaches the package, the run plan, the audit or any report; only whether one is configured does."
+                }
+              }
+            }
+          },
+          "bindingsFile": {
+            "type": "string",
+            "maxLength": 4096,
+            "description": "Absolute path to an openclaw-host-tool-bindings-v0 JSON document: further entries of the service-neutral openclaw.tool.json_http implementation, each one JSON POST to one exact HTTPS origin and path, with the schema digests, permission kinds, side effects and bounds the operator states for it. It cannot add an implementation category, an adapter or a local implementation, nor replace an entry this host already has. Read once at start; a document that fails validation adds nothing."
+          }
+        }
+      },
+      "hostResources": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "What this host holds for the person (travel profiles, identities, payment instruments, ...), so a package can request a type of resource without ever owning one. The person chooses whether to grant each request and which resource; a package receives only the granted resource, and only through the tool that links its permission.",
+        "properties": {
+          "file": {
+            "type": "string",
+            "maxLength": 4096,
+            "description": "Absolute path to an openclaw-host-resources-v0 JSON document: resource types (id, value schema, sealed fields) and resources (opaque id, display-safe label, value). Values never leave this host process except to the tool call a grant allows."
+          }
+        }
+      }
+    }
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "controlUi": {
+    "entry": "dist/control-ui/322580b1bfe322a82e2ede3ee012e061e31f74a053faca1386427cda66b9971f/index.js",
+    "styles": [
+      "dist/control-ui/322580b1bfe322a82e2ede3ee012e061e31f74a053faca1386427cda66b9971f/index.css"
+    ]
+  },
+  "contracts": {
+    "tools": []
+  }
+}

@@ -1,0 +1,291 @@
+/**
+ * The background service worker: the only place that holds state (D-035). It wires Chrome's
+ * APIs to the controller and nothing else: messages from extension pages and content
+ * scripts, tab navigation and removal, the action badge, and the side panel behaviour.
+ */
+import type { Http } from "../../core/models/catalog.js";
+import { builtinReader } from "../execution/builtin-port.js";
+import { SecretStore } from "../../core/secrets.js";
+import { TrustStore } from "../../core/trust.js";
+import { failure, isEvent, parseContentMessage, parseRequest, success, type Event } from "../messages.js";
+import { isHostCommand } from "../execution/protocol.js";
+import { Database } from "../storage/database.js";
+import { IndexedDbFileStore } from "../storage/files.js";
+import { IndexedDbModelStore } from "../storage/models.js";
+import type { EngineProbe } from "../execution/engine-protocol.js";
+import { IndexedDbMemoryStorage } from "../storage/memory.js";
+import { PermissionStorage, type PermissionsPort } from "../storage/permissions.js";
+import { IndexedDbRunStore } from "../storage/runs.js";
+import { IndexedDbConversationStore } from "../storage/conversations.js";
+import { AreaEnvelopeStorage, AreaUnlockedStateStorage } from "../storage/secrets-storage.js";
+import { SettingsStorage } from "../storage/settings.js";
+import { SubscriptionStorage } from "../storage/subscriptions.js";
+import { IndexedDbSnapshotStore } from "../storage/snapshots.js";
+import { ChromeTabStateStore } from "../storage/tab-state.js";
+import { ChromeTrustStorage } from "../storage/trust-storage.js";
+import { ChromeViewHolderStore } from "../storage/view-holders.js";
+import { Controller, type Sender } from "./controller.js";
+import { OffscreenHostBridge } from "./offscreen-host.js";
+import { chromeNativePort, nativePermissionGranted } from "./native-port.js";
+import { KeychainStorage } from "../storage/keychain-storage.js";
+
+const extensionOrigin = `chrome-extension://${chrome.runtime.id}`;
+/**
+ * The secret store (T16, D-191): the envelope in `storage.local`, the unlocked master key in
+ * `storage.session` (trusted contexts only, set below), the idle time from Settings → Security.
+ */
+const secrets: SecretStore = new SecretStore({
+  envelope: new AreaEnvelopeStorage(chrome.storage.local),
+  unlocked: new AreaUnlockedStateStorage(chrome.storage.session),
+  idleMinutes: async (): Promise<number | null> => (await settings.settings()).security.idle_lock_minutes,
+});
+const settings: SettingsStorage = new SettingsStorage(chrome.storage.local, secrets);
+/** The alarm that wipes an idle session key (D-192); Chrome's shortest period. */
+const LOCK_ALARM = "secret-store-idle-lock";
+const CONTEXT_MENU_ID = "webagents-discover";
+/** The built content script, injected under `activeTab` and registered for granted sites (D-190, D-194). */
+const DISCOVERY_SCRIPT = "content-script.js";
+const DISCOVERY_SCRIPT_ID = "webagents-discovery";
+
+/** Chrome's host permissions and the discovery script, as the controller needs them (T16). */
+const permissions: PermissionsPort = {
+  contains: (origins) => chrome.permissions.contains({ origins: [...origins] }),
+  granted: async () => (await chrome.permissions.getAll()).origins ?? [],
+  remove: (origins) => chrome.permissions.remove({ origins: [...origins] }),
+  async registerDiscovery(matches) {
+    const registered = await chrome.scripting.getRegisteredContentScripts({ ids: [DISCOVERY_SCRIPT_ID] });
+    if (registered.length > 0) await chrome.scripting.unregisterContentScripts({ ids: [DISCOVERY_SCRIPT_ID] });
+    if (matches.length > 0) await chrome.scripting.registerContentScripts([{ id: DISCOVERY_SCRIPT_ID, matches: [...matches], js: [DISCOVERY_SCRIPT], runAt: "document_idle", persistAcrossSessions: true }]);
+  },
+  async inject(tabId) {
+    await chrome.scripting.executeScript({ target: { tabId }, files: [DISCOVERY_SCRIPT] });
+  },
+};
+/** A model-catalog probe never waits longer than this. */
+const PROBE_TIMEOUT_MS = 10_000;
+const MAX_PROBE_BYTES = 2 * 1024 * 1024;
+
+/**
+ * The catalog transport (D-055): the only place a provider key is read. It is added as the
+ * provider's own header here and never leaves this worker; the core sees `key_configured` only.
+ * Requests go to the configured origins alone, with no credentials or referrer of the browser's.
+ */
+const http: Http = async (request) => {
+  const headers: Record<string, string> = { accept: "application/json", ...request.headers };
+  if (request.provider === "openai") {
+    const key = await settings.key("openai");
+    if (key) headers.authorization = `Bearer ${key}`;
+  } else if (request.provider === "anthropic") {
+    const key = await settings.key("anthropic");
+    if (key) headers["x-api-key"] = key;
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
+  try {
+    const response = await fetch(request.url, {
+      method: request.method,
+      headers,
+      body: request.body === undefined ? undefined : JSON.stringify(request.body),
+      credentials: "omit",
+      cache: "no-store",
+      referrerPolicy: "no-referrer",
+      redirect: "error",
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    if (text.length > MAX_PROBE_BYTES) return { status: response.status, body: null };
+    let body: unknown = null;
+    try {
+      body = text ? (JSON.parse(text) as unknown) : null;
+    } catch {
+      body = null;
+    }
+    return { status: response.status, body };
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+/**
+ * B-117: whether anything answers at a URL. A `no-cors` fetch succeeds (opaquely) when a server
+ * is up even if it refuses this origin, and fails when nothing listens; nothing is read.
+ */
+async function reachable(url: string): Promise<boolean> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3000);
+  try {
+    await fetch(url, { method: "GET", mode: "no-cors", credentials: "omit", cache: "no-store", referrerPolicy: "no-referrer", redirect: "manual", signal: controller.signal });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Chrome's built-in model as this worker's Prompt API reports it (D-113); the quota is measured once per worker. */
+const builtin = builtinReader();
+
+/**
+ * This worker's own reading of the machine for the in-browser route (T41, D-443), used until the
+ * engine Worker has measured: the WebGPU adapter Chrome exposes to service workers, the memory hint
+ * and the storage estimate. Never a network request; no device is created.
+ */
+async function localProbe(): Promise<Partial<EngineProbe> | null> {
+  const nav = navigator as Navigator & { gpu?: { requestAdapter(): Promise<{ info?: Record<string, unknown>; features: Iterable<string>; limits: Record<string, number>; isFallbackAdapter?: boolean } | null> }; deviceMemory?: number };
+  const storage = await navigator.storage.estimate().then((estimate) => ({ quota: estimate.quota ?? null, usage: estimate.usage ?? null })).catch(() => null);
+  let adapter: Awaited<ReturnType<NonNullable<typeof nav.gpu>["requestAdapter"]>> = null;
+  try {
+    adapter = nav.gpu ? await nav.gpu.requestAdapter() : null;
+  } catch {
+    adapter = null;
+  }
+  const info = (adapter?.info ?? {}) as Record<string, unknown>;
+  return {
+    has_webgpu: !!nav.gpu,
+    device_memory_gb: nav.deviceMemory ?? null,
+    storage,
+    adapter: adapter === null ? null : { vendor: (info.vendor as string) ?? null, architecture: (info.architecture as string) ?? null, description: (info.description as string) ?? null, is_fallback: typeof info.isFallbackAdapter === "boolean" ? info.isFallbackAdapter : null, features: [...adapter.features].sort(), max_buffer_size: adapter.limits.maxBufferSize ?? null, max_storage_buffer_binding_size: adapter.limits.maxStorageBufferBindingSize ?? null },
+  };
+}
+
+async function badge(tabId: number, count: number): Promise<void> {
+  try {
+    await chrome.action.setBadgeText({ tabId, text: count > 0 ? String(count) : "" });
+    if (count > 0) {
+      await chrome.action.setBadgeBackgroundColor({ tabId, color: "#0b6e4f" });
+      await chrome.action.setTitle({ tabId, title: `WebAgents: ${count} agent package${count === 1 ? "" : "s"} advertised on this page` });
+    } else {
+      await chrome.action.setTitle({ tabId, title: "WebAgents Agent Browser" });
+    }
+  } catch {
+    // The tab may be gone; a badge is cosmetic.
+  }
+}
+
+/** Which of these documents are still open: the side panel and full pages a view lives in. */
+async function liveDocuments(documentIds: string[]): Promise<Set<string>> {
+  const contexts = await chrome.runtime.getContexts({ documentIds });
+  return new Set(contexts.map((context) => context.documentId).filter((id): id is string => typeof id === "string"));
+}
+
+function broadcast(event: Event): void {
+  chrome.runtime.sendMessage(event).catch(() => {
+    // No page is listening; that is normal.
+  });
+}
+
+const database = new Database();
+const controller = new Controller({
+  fetch: (url, init) => fetch(url, init),
+  snapshots: new IndexedDbSnapshotStore(database),
+  runs: new IndexedDbRunStore(database),
+  conversations: new IndexedDbConversationStore(database),
+  files: new IndexedDbFileStore(database),
+  memoryStorage: new IndexedDbMemoryStorage(database),
+  subscriptions: new SubscriptionStorage(chrome.storage.local),
+  permissions,
+  permissionStorage: new PermissionStorage(chrome.storage.local),
+  host: new OffscreenHostBridge(),
+  trust: new TrustStore(new ChromeTrustStorage()),
+  tabs: new ChromeTabStateStore(),
+  holders: new ChromeViewHolderStore(),
+  liveDocuments,
+  settings,
+  http,
+  builtin,
+  reachable,
+  // The in-browser route (T41): the model cache's rows, the refreshed list and the measured machine.
+  models: new IndexedDbModelStore(database),
+  localArea: chrome.storage.local,
+  inBrowserProbe: localProbe,
+  badge,
+  broadcast,
+  version: chrome.runtime.getManifest().version,
+  // The optional native helper (T17, D-181, D-204): keychain unlock and Ollama's state.
+  native: chromeNativePort,
+  nativePermission: nativePermissionGranted,
+  keychain: new KeychainStorage(chrome.storage.local),
+});
+
+/**
+ * Who sent a message, from facts Chrome vouches for. An extension page is one whose frame URL
+ * is on the extension's own origin: the side panel (no tab) and `browser.html` (opened in a
+ * tab) alike. A content script's frame URL is the website's, so it never passes that test,
+ * and only the tab Chrome records for it, never anything it says, identifies the page.
+ */
+function senderOf(sender: chrome.runtime.MessageSender): Sender {
+  const fromExtensionPage = sender.id === chrome.runtime.id && typeof sender.url === "string" && sender.url.startsWith(`${extensionOrigin}/`);
+  return {
+    extensionPage: fromExtensionPage,
+    // The offscreen document (the execution host) is the only sender of `host.*` reports.
+    offscreen: fromExtensionPage && sender.url === `${extensionOrigin}/execution.html`,
+    tabId: sender.tab?.id ?? null,
+    tabUrl: sender.tab?.url ?? null,
+    frameUrl: typeof sender.url === "string" ? sender.url : null,
+    topFrame: sender.frameId === 0,
+    documentId: typeof sender.documentId === "string" ? sender.documentId : null,
+  };
+}
+
+chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) => {
+  if (isEvent(message)) return false; // Our own broadcasts, echoed back.
+  if (isHostCommand(message)) return false; // Our own commands to the execution host; it answers them.
+  const who = senderOf(sender);
+  (async () => {
+    try {
+      if (!who.extensionPage) {
+        // A content script: the one message it may send, judged against Chrome's view of the tab.
+        await controller.contentLinks(parseContentMessage(message), who);
+        return success({ received: true });
+      }
+      return success(await controller.handle(parseRequest(message), who));
+    } catch (error) {
+      return failure(error);
+    }
+  })().then(sendResponse, (error: unknown) => sendResponse(failure(error)));
+  return true;
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  void controller.clearTab(tabId);
+});
+
+chrome.tabs.onUpdated.addListener((tabId, change) => {
+  // A navigation starts: the previous page's advertisements no longer apply. The new page's
+  // content script reports again at document_idle.
+  if (change.status === "loading" && change.url) void controller.clearTab(tabId);
+});
+
+/** The session key is for the extension's own contexts only (D-181): never a content script's. */
+void chrome.storage.session.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" });
+
+/** Discovery on the clicked tab (D-190): the action click opens the panel and grants `activeTab`; the panel asks for the read. */
+chrome.runtime.onInstalled.addListener(() => {
+  void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+  chrome.contextMenus.create({ id: CONTEXT_MENU_ID, title: "Look for agents on this page", contexts: ["page"], documentUrlPatterns: ["https://*/*"] }, () => void chrome.runtime.lastError);
+  void controller.reconcilePermissions();
+});
+chrome.runtime.onStartup.addListener(() => {
+  void controller.reconcilePermissions();
+});
+// The context-menu item grants `activeTab` too, so the read works when the panel is already open
+// after a navigation. The keyboard shortcut is the reserved `_execute_action`: Chrome opens the
+// panel for it as for a click and never dispatches `commands.onCommand` for it (review 1, nit 7),
+// so the panel's own read on opening is the shortcut's path.
+chrome.contextMenus.onClicked.addListener((info, tab) => {
+  if (info.menuItemId === CONTEXT_MENU_ID && tab?.id !== undefined) void controller.readTab(tab.id).catch(() => undefined);
+});
+// Grants removed outside this extension (chrome://extensions): the records and the discovery script follow Chrome.
+chrome.permissions.onRemoved.addListener(() => void controller.reconcilePermissions());
+chrome.permissions.onAdded.addListener(() => void controller.reconcilePermissions());
+
+// The idle lock's sweep (D-192): every minute, locking when a key is held past the idle time, through
+// the controller so that its caches follow the lock (T17 review 2, nit 2); the lazy check in the store covers the rest.
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name !== LOCK_ALARM) return;
+  void controller.lockIfIdle().catch(() => undefined);
+});
+void chrome.alarms.get(LOCK_ALARM).then((alarm) => {
+  if (!alarm) void chrome.alarms.create(LOCK_ALARM, { periodInMinutes: 1 });
+});
